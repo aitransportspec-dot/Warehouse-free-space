@@ -1,13 +1,26 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
-import csv, os, random
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import csv, os, random, pathlib
 
 app = FastAPI(title="Warehouse Free Space API (No-BRC)")
 
-BASE_DIR = os.path.dirname(__file__)
-LOCATIONS_CSV = os.path.join(BASE_DIR, "locations.csv")
+BASE_PATH = pathlib.Path(__file__).parent
+LOCATIONS_CSV = BASE_PATH / "locations.csv"
 
+# ---- Front (mobilny) ----
+# Serwuj folder static/ jeśli istnieje, a / zwraca index.html
+if (BASE_PATH / "static").exists():
+    app.mount("/static", StaticFiles(directory=str(BASE_PATH / "static")), name="static")
+
+    @app.get("/", response_class=HTMLResponse)
+    def home():
+        index = BASE_PATH / "static" / "index.html"
+        return index.read_text(encoding="utf-8")
+
+# ---- Modele ----
 class Reservation(BaseModel):
     id: str
     location_ids: List[str]
@@ -16,70 +29,97 @@ class Reservation(BaseModel):
     until_ts: Optional[str] = None
     status: str = "ACTIVE"
 
-locations = {}
-reservations = {}
+# ---- Pamięć ----
+locations: dict[str, dict] = {}
+reservations: dict[str, dict] = {}
 
-def _generate_fake_dataset(path: str, count_racked=900, count_flex1=100, count_flex2_groups=25, docks=4, yard=20):
-    rows = []
-    # RACKED (3 areas)
-    def add_racked(area_id, aisles, bays, levels, positions):
-        for a in range(1, aisles+1):
-            for b in range(1, bays+1):
-                for l in range(1, levels+1):
-                    for p in range(1, positions+1):
+# ---- Pomocnicze: format ID dla RACKED ----
+def _aisle_letters(n: int) -> str:
+    """
+    1 -> AA, 2 -> AB, ... 26 -> AZ, 27 -> BA, 28 -> BB, ...
+    """
+    n0 = n - 1
+    first = n0 // 26
+    second = n0 % 26
+    return chr(65 + first) + chr(65 + second)
+
+def _level_letter(level: int) -> str:
+    """1 -> 'a', 2 -> 'b', 3 -> 'c', 4 -> 'd'..."""
+    return chr(96 + level)
+
+# ---- Generator datasetu ----
+def _generate_fake_dataset(path: pathlib.Path):
+    rows: List[dict] = []
+
+    # RACKED – 3 obszary; ID w formacie W1AA-01-a itd.
+    def add_racked(area_id: str, aisles: int, bays_per_aisle: int, levels: int, positions_per_level: int):
+        for a in range(1, aisles + 1):
+            letters = _aisle_letters(a)  # AA, AB, ...
+            for b in range(1, bays_per_aisle + 1):
+                for l in range(1, levels + 1):
+                    for p in range(1, positions_per_level + 1):
+                        lvl = _level_letter(l)  # a, b, c...
+                        human_id = f"W1{letters}-{b:02d}-{lvl}"  # >>> nowy format tylko dla RACKED
                         rows.append({
-                            "id": f"R-A{a:02d}-B{b:02d}-L{l:02d}-P{p:02d}-{area_id}",
-                            "area_id": area_id, "area_type":"RACKED",
+                            "id": human_id,
+                            "area_id": area_id,
+                            "area_type": "RACKED",
                             "aisle": a, "bay": b, "level": l, "position": p,
-                            "length_mm": random.choice([1200,1200,1000]),
-                            "width_mm": random.choice([800,1000]),
-                            "height_mm": random.choice([1500,1600,1700]),
-                            "max_weight_kg": random.choice([800,1000,1200,1500]),
-                            "status": random.choices(["FREE","OCCUPIED","RESERVED","BLOCKED","MAINT"], [65,25,5,3,2])[0],
+                            "length_mm": random.choice([1200, 1200, 1000]),
+                            "width_mm": random.choice([800, 1000]),
+                            "height_mm": random.choice([1500, 1600, 1700]),
+                            "max_weight_kg": random.choice([800, 1000, 1200, 1500]),
+                            "status": random.choices(["FREE", "OCCUPIED", "RESERVED", "BLOCKED", "MAINT"],
+                                                     [65, 25, 5, 3, 2])[0],
                             "group_id": ""
                         })
-    add_racked("RACK-01", 12, 10, 3, 1)  # 360
-    add_racked("RACK-02", 10, 10, 3, 1)  # 300
-    add_racked("RACK-03", 8, 10, 3, 1)   # 240  -> 900
 
-    # FLEX-01 grid 10x10
+    add_racked("RACK-01", aisles=12, bays_per_aisle=10, levels=3, positions_per_level=1)  # 360
+    add_racked("RACK-02", aisles=10, bays_per_aisle=10, levels=3, positions_per_level=1)  # 300
+    add_racked("RACK-03", aisles=8,  bays_per_aisle=10, levels=3, positions_per_level=1)  # 240  -> 900
+
+    # FLEX-01 grid 10x10 (ID jak wcześniej)
     for i in range(1, 101):
         rows.append({
-            "id": f"FLEX-01-G{i:03d}", "area_id": "FLEX-01", "area_type":"FLEX",
-            "aisle":"", "bay":"", "level":"", "position":"",
+            "id": f"FLEX-01-G{i:03d}", "area_id": "FLEX-01", "area_type": "FLEX",
+            "aisle": None, "bay": None, "level": None, "position": None,
             "length_mm": 1000, "width_mm": 1000, "height_mm": 2000,
             "max_weight_kg": 2000,
             "status": random.choices(["FREE","OCCUPIED","RESERVED","BLOCKED","MAINT"], [70,20,5,3,2])[0],
             "group_id": ""
         })
-    # FLEX-02 oversize groups (25x2)
-    for g in range(1, 26):
+
+    # FLEX-02 oversize – grupy po 2 sloty
+    for g in range(1, 26):  # 25 grup = 50 slotów
         gid = f"FLEX-02-OVR-{g:02d}"
-        for s in range(1, 2+1):
+        for s in range(1, 3):
             rows.append({
-                "id": f"{gid}-S{s}", "area_id": "FLEX-02", "area_type":"FLEX",
-                "aisle":"", "bay":"", "level":"", "position":"",
-                "length_mm": 2000 if s==1 else 1000, "width_mm": 1000, "height_mm": 2200,
+                "id": f"{gid}-S{s}", "area_id": "FLEX-02", "area_type": "FLEX",
+                "aisle": None, "bay": None, "level": None, "position": None,
+                "length_mm": 2000 if s == 1 else 1000, "width_mm": 1000, "height_mm": 2200,
                 "max_weight_kg": 2500,
                 "status": random.choices(["FREE","OCCUPIED","RESERVED","BLOCKED","MAINT"], [60,25,7,5,3])[0],
                 "group_id": gid
             })
+
     # DOCKS
-    for d in range(1, docks+1):
+    for d in range(1, 5):
         rows.append({
-            "id": f"DOCK-D{d:02d}", "area_id": "DOCK", "area_type":"DOCK",
-            "aisle":"", "bay":"", "level":"", "position":"",
+            "id": f"DOCK-D{d:02d}", "area_id": "DOCK", "area_type": "DOCK",
+            "aisle": None, "bay": None, "level": None, "position": None,
             "length_mm": 2500, "width_mm": 2200, "height_mm": 2500,
-            "max_weight_kg": 3000, "status": random.choice(["FREE","OCCUPIED"]), "group_id":""
+            "max_weight_kg": 3000, "status": random.choice(["FREE", "OCCUPIED"]), "group_id": ""
         })
-    # YARD pads
-    for y in range(1, yard+1):
+
+    # YARD
+    for y in range(1, 21):
         rows.append({
-            "id": f"YARD-PAD-{y:02d}", "area_id": "YARD", "area_type":"YARD",
-            "aisle":"", "bay":"", "level":"", "position":"",
+            "id": f"YARD-PAD-{y:02d}", "area_id": "YARD", "area_type": "YARD",
+            "aisle": None, "bay": None, "level": None, "position": None,
             "length_mm": 3000, "width_mm": 3000, "height_mm": 0,
-            "max_weight_kg": 5000, "status": random.choice(["FREE","OCCUPIED","RESERVED"]), "group_id":""
+            "max_weight_kg": 5000, "status": random.choice(["FREE","OCCUPIED","RESERVED"]), "group_id": ""
         })
+
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -87,14 +127,13 @@ def _generate_fake_dataset(path: str, count_racked=900, count_flex1=100, count_f
             writer.writerow(r)
 
 def load_locations():
-    # jeśli nie ma CSV w repo – wygeneruj automatycznie
-    if not os.path.exists(LOCATIONS_CSV):
+    if not LOCATIONS_CSV.exists():
         _generate_fake_dataset(LOCATIONS_CSV)
     with open(LOCATIONS_CSV, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
             def _to_int(x):
-                return int(x) if x not in ("", "None", None) else None
+                return int(x) if x not in ("", "None", None, "") else None
             r["aisle"] = _to_int(r.get("aisle"))
             r["bay"] = _to_int(r.get("bay"))
             r["level"] = _to_int(r.get("level"))
@@ -107,6 +146,7 @@ def load_locations():
 
 load_locations()
 
+# ---- Endpoints ----
 @app.get("/health")
 def health():
     return {"ok": True, "locations": len(locations)}
@@ -140,22 +180,28 @@ def get_locations(
 @app.post("/reserve")
 def reserve(res: Reservation):
     for lid in res.location_ids:
-        if lid not in locations: raise HTTPException(404, f"Location {lid} not found")
-        if locations[lid]["status"] != "FREE": raise HTTPException(409, f"Location {lid} not FREE")
-    for lid in res.location_ids: locations[lid]["status"] = "RESERVED"
+        if lid not in locations:
+            raise HTTPException(404, f"Location {lid} not found")
+        if locations[lid]["status"] != "FREE":
+            raise HTTPException(409, f"Location {lid} not FREE")
+    for lid in res.location_ids:
+        locations[lid]["status"] = "RESERVED"
     reservations[res.id] = res.dict()
     return {"ok": True, "reservation": reservations[res.id]}
 
 @app.post("/occupy/{location_id}")
 def occupy(location_id: str, pallet_ref: Optional[str] = None):
-    if location_id not in locations: raise HTTPException(404, "Location not found")
-    if locations[location_id]["status"] not in ("FREE", "RESERVED"): raise HTTPException(409, "Location not FREE/RESERVED")
+    if location_id not in locations:
+        raise HTTPException(404, "Location not found")
+    if locations[location_id]["status"] not in ("FREE", "RESERVED"):
+        raise HTTPException(409, "Location not FREE/RESERVED")
     locations[location_id]["status"] = "OCCUPIED"
     return {"ok": True, "location": locations[location_id]}
 
 @app.post("/free/{location_id}")
 def free(location_id: str):
-    if location_id not in locations: raise HTTPException(404, "Location not found")
+    if location_id not in locations:
+        raise HTTPException(404, "Location not found")
     locations[location_id]["status"] = "FREE"
     return {"ok": True, "location": locations[location_id]}
 
