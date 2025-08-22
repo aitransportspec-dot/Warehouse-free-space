@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Warehouse Free Space</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f9f9f9; margin:0; padding:20px; }
+    h1 { font-size:20px; }
+    button { padding:12px 20px; margin-bottom:20px; font-size:16px; }
+    .slot { background:white; padding:10px; margin-bottom:10px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+    .slot strong { display:block; font-size:14px; }
+    .slot small { color:#666; }
+  </style>
+</head>
+<body>
+  <h1>Wolne miejsca w magazynie</h1>
+  <button onclick="loadFree()">🔎 Pokaż wolne</button>
+  <div id="list"></div>
+
+  <script>
+    async function loadFree() {
+      const res = await fetch('/locations?status=FREE&area_type=RACKED&limit=10');
+      const data = await res.json();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      data.items.forEach(loc => {
+        const div = document.createElement('div');
+        div.className = 'slot';
+        div.innerHTML = `<strong>${loc.id}</strong>
+                         <small>${loc.area_type} – ${loc.status}</small>`;
+        list.appendChild(div);
+      });
+    }
+  </script>
+</body>
+</html>
